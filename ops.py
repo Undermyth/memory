@@ -2,10 +2,13 @@ import torch
 import triton.language as tl
 import triton
 import ipdb
+import taichi as ti
 
 triton.Config.debug = True
 
-def mem_update(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: torch.Tensor, lr: torch.Tensor, w: torch.Tensor, wts: torch.Tensor, B: int, T: int, H: int, d: int):
+def mem_update_forward_hand(q, k, v, lr, 
+                            o, w, wts, 
+                            B: int, T: int, H: int, d: int):
     for t in range(T):
         wts[:, :, t] = w
         o[:, t] = (q[:, t].view(B, H, 1, d) @ w).view(B, H, d) # recall first
@@ -13,51 +16,67 @@ def mem_update(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: torch.Tenso
         dw = lr[:, t].view(B, H, 1, d) * dw
         w = w + dw
 
-class MemUpdate(torch.autograd.Function):
+def mem_update_backward_hand(q, k, v, lr, o_grad, wts,
+                            q_grad, k_grad, v_grad, lr_grad,        
+                             B: int, T: int, H: int, d: int):
+    # at the last step, k, v and lr actually never contribute to the result. only q has its grad
+    q_grad[:, -1] = (o_grad[:, -1].view(B, H, 1, d) @ wts[:, :, -1].transpose(-1, -2)).view(B, H, d)
+    k_grad[:, -1] = torch.zeros_like(k[:, -1])
+    v_grad[:, -1] = torch.zeros_like(v[:, -1])
+    lr_grad[:, -1] = torch.zeros_like(lr[:, -1])
+
+    w_grad_i = q[:, -1].view(B, H, d, 1) @ o_grad[:, -1].view(B, H, 1, d)
+
+    for t in range(T-2, -1, -1):
+        # dw = wts[:, :, t+1] - wts[:, :, t]
+        dw = k[:, t].view(B, H, d, 1) @ (v[:, t].view(B, H, 1, d) - k[:, t].view(B, H, 1, d) @ wts[:, :, t])
+        lr_grad[:, t] = (w_grad_i * dw).sum(dim=-2)
+        q_grad[:, t] = (o_grad[:, t].view(B, H, 1, d) @ wts[:, :, t].transpose(-1, -2)).view(B, H, d)
+        scaled_w_grad = lr[:, t].view(B, H, 1, d) * w_grad_i
+        v_grad[:, t] = (k[:, t].view(B, H, 1, d) @ scaled_w_grad).view(B, H, d)
+        w_scaled_w_grad = wts[:, :, t] @ scaled_w_grad.transpose(-1, -2)
+        k_grad[:, t] = (v[:, t].view(B, H, 1, d) @ scaled_w_grad.transpose(-1, -2)).view(B, H, d)
+        k_grad[:, t] -= (k[:, t].view(B, H, 1, d) @ (w_scaled_w_grad + w_scaled_w_grad.transpose(-1, -2))).view(B, H, d)
+        w_grad_i += q[:, t].view(B, H, d, 1) @ o_grad[:, t].view(B, H, 1, d)
+        w_grad_i -= k[:, t].view(B, H, d, 1) @ (k[:, t].view(B, H, 1, d) @ scaled_w_grad)
+
+class MemUpdateHand(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, lr, B, T, H, d):
         o = torch.empty_like(q)
         w = torch.zeros(B, H, d, d, device=q.device, dtype=q.dtype)
         wts = torch.empty(B, H, T, d, d, device=q.device, dtype=q.dtype)
-        mem_update(q, k, v, o, lr, w, wts, B, T, H, d)
-        ctx.save_for_backward(q, k, v, o, lr, wts)
+        mem_update_forward_hand(q, k, v, lr, o, w, wts, B, T, H, d)
+        ctx.save_for_backward(q, k, v, lr, wts)
         ctx.B, ctx.T, ctx.H, ctx.d = B, T, H, d
-        return o, w, wts
+        return o
     
     @staticmethod
-    def backward(ctx, o_grad, w_grad, wts_grad):
+    def backward(ctx, o_grad):
         # w_grad and wts_grad are None
-        q, k, v, o, lr, wts = ctx.saved_tensors
+        q, k, v, lr, wts = ctx.saved_tensors
         B, T, H, d = ctx.B, ctx.T, ctx.H, ctx.d
         q_grad = torch.empty_like(q)
         k_grad = torch.empty_like(k)
         v_grad = torch.empty_like(v)
         lr_grad = torch.empty_like(lr)
-
-        # at the last step, k, v and lr actually never contribute to the result. only q has its grad
-        q_grad[:, -1] = (o_grad[:, -1].view(B, H, 1, d) @ wts[:, :, -1].transpose(-1, -2)).view(B, H, d)
-        k_grad[:, -1] = torch.zeros_like(k[:, -1])
-        v_grad[:, -1] = torch.zeros_like(v[:, -1])
-        lr_grad[:, -1] = torch.zeros_like(lr[:, -1])
-
-        w_grad_i = q[:, -1].view(B, H, d, 1) @ o_grad[:, -1].view(B, H, 1, d)
-
-        for t in range(T-2, -1, -1):
-            dw = wts[:, :, t+1] - wts[:, :, t]
-            lr_grad[:, t] = (w_grad_i * dw).sum(dim=0)
-            q_grad[:, t] = (o_grad[:, t].view(B, H, 1, d) @ wts[:, :, t].transpose(-1, -2)).view(B, H, d)
-            scaled_w_grad = lr[:, t].view(B, H, 1, d) * w_grad_i
-            v_grad[:, t] = (k[:, t].view(B, H, 1, d) @ scaled_w_grad).view(B, H, d)
-            w_scaled_w_grad = wts[:, :, t] @ scaled_w_grad.transpose(-1, -2)
-            k_grad[:, t] = (v[:, t].view(B, H, 1, d) @ scaled_w_grad.transpose(-1, -2)).view(B, H, d)
-            k_grad[:, t] -= (k[:, t].view(B, H, 1, d) @ (w_scaled_w_grad - w_scaled_w_grad.transpose(-1, -2))).view(B, H, d)
-            w_grad_i += q[:, t].view(B, H, d, 1) @ o[:, t].view(B, H, 1, d)
-            w_grad_i -= k[:, t].view(B, H, d, 1) @ (k[:, t].view(B, H, 1, d) @ scaled_w_grad)
+        mem_update_backward_hand(q, k, v, lr, o_grad, wts, q_grad, k_grad, v_grad, lr_grad, B, T, H, d)
 
         return (q_grad, k_grad, v_grad, lr_grad, None, None, None, None)
 
 def mem_update_hand(q, k, v, lr, B, T, H, d):
-    return MemUpdate.apply(q, k, v, lr, B, T, H, d)
+    return MemUpdateHand.apply(q, k, v, lr, B, T, H, d)
+
+# @ti.kernel
+# def mem_update_forward_taichi(q: ti.types.ndarray(ndim=4), 
+#                               k: ti.types.ndarray(ndim=4), 
+#                               v: ti.types.ndarray(ndim=4), 
+#                               lr: ti.types.ndarray(ndim=4), 
+#                               o: ti.types.ndarray(ndim=4), 
+#                               w: ti.types.ndarray(ndim=4), 
+#                               wts: ti.types.ndarray(ndim=4), 
+#                               B: int, T: int, H: int, d: int):
+    
 
 @triton.jit
 def vec_mat_mul(vec, mat):
@@ -162,4 +181,4 @@ def mem_update_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lr: torch.
     # print(o.flatten(-2, -1)[0])
 
     # print(o[0, :, 0, :])
-    return o, w, wts
+    return o

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 import torch.nn.functional as F
-from ops import mem_update, mem_update_fwd, mem_update_hand
+from ops import mem_update_fwd, mem_update_hand
 import time
 import unittest
 
@@ -99,61 +99,10 @@ class WorkingMemory(nn.Module):
         
         #print(w.norm().item())
         
-        return o, w     # NOTE: return w just for accuracy testing
+        return o
 
-class HandGradWorkingMemory(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.query = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.key = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.value = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.out = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        
-        self.w_lr = nn.Linear(config.hidden_size, config.hidden_size)
-        #nn.init.normal_(self.w_lr.weight, std=config.init_std)
-        nn.init.constant_(self.w_lr.bias, 0)
-        
-        self.wm_head = config.wm_head
-        self.wm_size = config.hidden_size // config.wm_head
-        
-    def forward(self, x):
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-        
-        B, T, D = q.size()
-        H = self.wm_head
-        d = self.wm_size
-
-        q = q.view(B, T, self.wm_head, -1)
-        k = k.view(B, T, self.wm_head, -1)
-        v = v.view(B, T, self.wm_head, -1)
-        
-        #q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        v = F.normalize(v, dim=-1)
-        
-        lr = torch.sigmoid(self.w_lr(x)).view(B, T, self.wm_head, -1)# * self.lr
-        
-        o = torch.empty_like(q)
-        w = torch.zeros((B, H, d, d), device=q.device, dtype=q.dtype)
-        
-        # for t in range(T):
-        #     o[:, t] = (q[:, t].view(B, H, 1, d) @ w).view(B, H, d) # recall first
-        #     dw = k[:, t].view(B, H, d, 1) @ (v[:, t].view(B, H, 1, d) - k[:, t].view(B, H, 1, d) @ w)
-        #     dw = lr[:, t].view(B, H, 1, d) * dw
-        #     w = w + dw
-        o, w, wts = mem_update_hand(q, k, v, lr, B, T, H, d)
-
-        o = o.view(B, T, -1)
-        o = self.out(o)
-        
-        #print(w.norm().item())
-        
-        return o, w     # NOTE: return w just for accuracy testing
-    
 class FastWorkingMemory(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, mode):
         super().__init__()
         self.query = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.key = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
@@ -166,6 +115,8 @@ class FastWorkingMemory(nn.Module):
         
         self.wm_head = config.wm_head
         self.wm_size = config.hidden_size // config.wm_head
+
+        self.mode = mode
         
     def forward(self, x):
         q = self.query(x)
@@ -195,12 +146,15 @@ class FastWorkingMemory(nn.Module):
         #     dw = lr[:, t].view(B, H, 1, d) * dw
         #     w = w + dw
         # NOTE: result should be explicitly assigned for synchronization
-        o, w, wts = mem_update_fwd(q, k, v, lr, B, T, H, d)
+        if self.mode == "kernel":
+            o = mem_update_fwd(q, k, v, lr, B, T, H, d)
+        elif self.mode == "hand":
+            o = mem_update_hand(q, k, v, lr, B, T, H, d)
         
         o = o.view(B, T, -1)
         o = self.out(o)
         
-        return o, w     # NOTE: return w just for accuracy testing
+        return o
     
 class TestWorkingMemory(unittest.TestCase):
 
@@ -208,7 +162,7 @@ class TestWorkingMemory(unittest.TestCase):
         # 初始化配置和模型
         self.config = Config(256, 4)
         self.ref_model = WorkingMemory(self.config).cuda()
-        self.test_model = FastWorkingMemory(self.config).cuda()
+        self.test_model = FastWorkingMemory(self.config, mode="hand").cuda()
         # self.test_model = HandGradWorkingMemory(self.config).cuda()
         self.x = torch.randn(4, 1024, 256).cuda()
 
@@ -223,9 +177,38 @@ class TestWorkingMemory(unittest.TestCase):
         test_output = self.test_model(self.x)
         
         # 使用assertAllClose来检查输出是否一致
-        self.assertTrue(detailed_allclose_check(ref_output[0], test_output[0], atol=1e-5, rtol=1e-5))
-        self.assertTrue(detailed_allclose_check(ref_output[1], test_output[1], atol=1e-5, rtol=1e-5))
+        self.assertTrue(detailed_allclose_check(ref_output, test_output, atol=1e-5, rtol=1e-5))
         print("fp32 numerical test passed")
+
+    def test_bwd_numeric(self):
+        # 测试反向传播的数值一致性
+        ref_output = self.ref_model(self.x)
+        test_output = self.test_model(self.x)
+        
+        # 计算损失并反向传播
+        ref_output.mean().backward()
+        test_output.mean().backward()
+        
+        # 检查每个Linear层的梯度
+        linear_layers = ['query', 'key', 'value', 'w_lr']
+        for layer_name in linear_layers:
+            ref_layer = getattr(self.ref_model, layer_name)
+            test_layer = getattr(self.test_model, layer_name)
+            
+            # 检查权重梯度
+            try:
+                detailed_allclose_check(ref_layer.weight.grad, test_layer.weight.grad)
+                print(f"{layer_name} weight gradients match")
+            except AssertionError as e:
+                raise AssertionError(f"Gradient mismatch in {layer_name} weights: {str(e)}")
+            
+            # 如果有bias，检查bias梯度
+            if ref_layer.bias is not None:
+                try:
+                    detailed_allclose_check(ref_layer.bias.grad, test_layer.bias.grad)
+                    print(f"{layer_name} bias gradients match")
+                except AssertionError as e:
+                    raise AssertionError(f"Gradient mismatch in {layer_name} bias: {str(e)}")
 
     def test_speedup(self):
         # 测试速度提升
